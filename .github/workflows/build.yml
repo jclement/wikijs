@@ -87,7 +87,6 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     environment: prod
-    needs: [beta]
     permissions:
       packages: write
       contents: write
