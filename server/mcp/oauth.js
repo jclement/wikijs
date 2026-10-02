@@ -8,8 +8,8 @@ const crypto = require('crypto')
 // rotating refresh tokens with reuse detection.
 
 const SCOPES = {
-  'wiki:read': 'Search and read the pages you can read',
-  'wiki:write': 'Create, edit, move and delete pages you are allowed to change'
+  'wiki:read': 'Search, read and download the pages and files you can read',
+  'wiki:write': 'Create, edit, move and delete pages you are allowed to change, and upload files where you are allowed to'
 }
 const DEFAULT_SCOPE = 'wiki:read'
 
@@ -18,6 +18,9 @@ const ACCESS_TTL = 60 * 60
 const REFRESH_TTL = 30 * 24 * 60 * 60
 const CONSENT_TTL = 10 * 60
 const UNUSED_CLIENT_TTL = 24 * 60 * 60
+const UPLOAD_TTL = 10 * 60
+const DOWNLOAD_TTL = 5 * 60
+const FILE_TOKEN_KINDS = ['upload', 'download']
 const MAX_REDIRECT_URIS = 10
 
 const FORBIDDEN_SCHEMES = ['javascript:', 'data:', 'file:', 'vbscript:', 'about:', 'blob:', 'ws:', 'wss:', 'ftp:']
@@ -48,6 +51,8 @@ module.exports = {
   OAuthError,
   SCOPES,
   ACCESS_TTL,
+  UPLOAD_TTL,
+  DOWNLOAD_TTL,
 
   isEnabled () {
     return [true, 'true', 1, '1'].includes(_.get(WIKI.config, 'mcp.enabled', false))
@@ -251,7 +256,7 @@ module.exports = {
   },
 
   async insertToken ({ grantId, kind, ttl, meta }) {
-    const prefix = { code: 'wmcp_ac_', access: 'wmcp_at_', refresh: 'wmcp_rt_' }[kind]
+    const prefix = { code: 'wmcp_ac_', access: 'wmcp_at_', refresh: 'wmcp_rt_', upload: 'wmcp_up_', download: 'wmcp_dl_' }[kind]
     const token = randomToken(prefix)
     await WIKI.models.knex('mcpTokens').insert({
       grantId,
@@ -404,6 +409,44 @@ module.exports = {
       user,
       scopes: grant.scope.split(' '),
       grantId: grant.id,
+      clientName: _.get(client, 'name', 'Unknown')
+    }
+  },
+
+  /**
+   * Issue a short-lived token that lets the holder of its URL send or fetch one file.
+   * It belongs to the connection, so it dies with it, and carries no other access.
+   */
+  async createFileToken ({ grantId, kind, scope, assetPath, overwrite = false }) {
+    await WIKI.models.knex('mcpTokens').where('grantId', grantId).whereIn('kind', FILE_TOKEN_KINDS).where('expiresAt', '<', isoNow()).del()
+    return this.insertToken({
+      grantId,
+      kind,
+      ttl: kind === 'upload' ? UPLOAD_TTL : DOWNLOAD_TTL,
+      meta: { scope, assetPath, overwrite }
+    })
+  },
+
+  /**
+   * Resolve a file token to its user, with fresh permissions, or null.
+   * Upload tokens are single-use and are consumed here.
+   */
+  async openFileToken (token, kind) {
+    if (!FILE_TOKEN_KINDS.includes(kind)) { return null }
+    const entry = await this.findToken(token, kind)
+    if (!entry || entry.usedAt || entry.expiresAt < isoNow()) { return null }
+    const grant = await WIKI.models.knex('mcpGrants').where('id', entry.grantId).first()
+    const meta = JSON.parse(entry.meta)
+    // The connection must still hold the scope the token was issued under
+    if (!grant || !grant.scope.split(' ').includes(meta.scope)) { return null }
+    const user = await this.getUser(grant.userId)
+    if (!user) { return null }
+    if (kind === 'upload' && !(await this.consumeToken(entry.id))) { return null }
+    const client = await WIKI.models.knex('mcpClients').where('id', grant.clientId).first()
+    return {
+      user,
+      assetPath: meta.assetPath,
+      overwrite: meta.overwrite === true,
       clientName: _.get(client, 'name', 'Unknown')
     }
   },

@@ -1,6 +1,8 @@
 const express = require('express')
 const router = express.Router()
 const _ = require('lodash')
+const fs = require('fs-extra')
+const assets = require('../mcp/assets')
 const oauth = require('../mcp/oauth')
 const rpc = require('../mcp/rpc')
 
@@ -49,6 +51,44 @@ const redirectWith = (res, redirectUri, params) => {
   url.searchParams.set('iss', oauth.baseUrl())
   secureHeaders(res)
   res.redirect(url.toString())
+}
+
+/**
+ * Stream a request body to a file, failing once it grows past maxBytes
+ */
+const receiveBody = (req, dest, maxBytes) => new Promise((resolve, reject) => {
+  const out = fs.createWriteStream(dest)
+  let size = 0
+  let settled = false
+  const fail = err => {
+    if (settled) { return }
+    settled = true
+    req.unpipe(out)
+    out.destroy()
+    reject(err)
+  }
+  req.on('data', chunk => {
+    size += chunk.length
+    if (size > maxBytes) {
+      fail(new assets.AssetError(`The file is larger than the ${maxBytes} byte limit of this wiki.`, 413))
+    }
+  })
+  req.on('aborted', () => fail(new Error('upload aborted by the client')))
+  req.on('error', fail)
+  out.on('error', fail)
+  out.on('finish', () => {
+    if (!settled) {
+      settled = true
+      resolve(size)
+    }
+  })
+  req.pipe(out)
+})
+
+const sendFileError = (res, status, message) => {
+  secureHeaders(res)
+  if (status === 413) { res.set('Connection', 'close') }
+  res.status(status).json({ ok: false, error: message })
 }
 
 const isSignedIn = req => req.user && _.isInteger(req.user.id) && req.user.id !== 2
@@ -313,6 +353,82 @@ router.post('/oauth/connections/revoke', async (req, res, next) => {
 })
 
 /**
+ * File links handed out by the asset tools. The token in the URL is the only credential:
+ * it is bound to one file and one connection, and the user's permissions are checked again on use.
+ */
+const fileRateLimit = rateLimit('files', 300, 10 * 60 * 1000)
+
+router.get('/mcp/download/:token', fileRateLimit, async (req, res) => {
+  try {
+    const file = await oauth.openFileToken(req.params.token, 'download')
+    const asset = file ? await assets.findReadable(file.user, file.assetPath) : null
+    if (!asset) {
+      return sendFileError(res, 404, 'This download link is invalid or has expired.')
+    }
+    const data = await assets.readData(asset)
+    secureHeaders(res)
+    res.attachment(asset.filename)
+    res.set('Content-Type', assets.mimeOf(asset.filename))
+    res.set('X-Content-Type-Options', 'nosniff')
+    res.set('Content-Security-Policy', `default-src 'none'; sandbox`)
+    res.set('Referrer-Policy', 'no-referrer')
+    res.send(data)
+  } catch (err) {
+    if (err instanceof assets.AssetError) {
+      return sendFileError(res, 404, 'This download link is invalid or has expired.')
+    }
+    WIKI.logger.warn(`MCP: file download failed: ${err.message}`)
+    sendFileError(res, 500, 'Internal error.')
+  }
+})
+
+const receiveUpload = async (req, res) => {
+  // Bodies of these types were already consumed by the wiki's body parsers: refuse before using up the link
+  if (req.is('json') || req.is('urlencoded') || req.is('multipart')) {
+    return sendFileError(res, 415, 'Send the raw file bytes as the request body (e.g. curl -T file "<url>"), not JSON, a form or multipart/form-data. This link has not been used up.')
+  }
+  if (_.toSafeInteger(req.get('content-length')) > assets.maxFileSize()) {
+    return sendFileError(res, 413, `The file is larger than the ${assets.maxFileSize()} byte limit of this wiki.`)
+  }
+  let tmpPath = null
+  try {
+    const file = await oauth.openFileToken(req.params.token, 'upload')
+    if (!file) {
+      return sendFileError(res, 404, 'This upload link is invalid, has expired or was already used. Ask for a new one with create_asset_upload.')
+    }
+    tmpPath = await assets.tempPath()
+    await receiveBody(req, tmpPath, assets.maxFileSize())
+    const stored = await assets.store(file.user, file.assetPath, tmpPath, { overwrite: file.overwrite })
+    WIKI.logger.info(`MCP: user ${file.user.id} via "${file.clientName}" ${stored.replaced ? 'replaced file' : 'uploaded file'} ${stored.path} (${stored.size} bytes)`)
+    secureHeaders(res)
+    res.status(201).json({
+      ok: true,
+      path: stored.path,
+      url: `${oauth.baseUrl()}/${stored.path}`,
+      size: stored.size,
+      replaced: stored.replaced,
+      markdown: assets.markdownFor(stored.path)
+    })
+  } catch (err) {
+    if (tmpPath) { await fs.remove(tmpPath).catch(() => {}) }
+    if (err instanceof assets.AssetError) {
+      return sendFileError(res, err.status, `${err.message} This link has been used up; ask for a new one with create_asset_upload.`)
+    }
+    WIKI.logger.warn(`MCP: file upload failed: ${err.message}`)
+    if (!res.headersSent && !req.aborted) {
+      sendFileError(res, 500, 'The wiki could not store the file because of an internal error.')
+    }
+  }
+}
+
+router.put('/mcp/upload/:token', fileRateLimit, receiveUpload)
+router.post('/mcp/upload/:token', fileRateLimit, receiveUpload)
+router.all(['/mcp/upload/:token', '/mcp/download/:token'], (req, res) => {
+  res.set('Allow', req.path.startsWith('/mcp/upload/') ? 'PUT, POST' : 'GET')
+  sendFileError(res, 405, 'Method not allowed.')
+})
+
+/**
  * MCP endpoint (Streamable HTTP, stateless)
  */
 router.all('/mcp', async (req, res) => {
@@ -349,13 +465,20 @@ router.all('/mcp', async (req, res) => {
  * must still be answered in the format API clients expect
  */
 router.errorHandler = (err, req, res, next) => {
-  const isApiPath = req.path === '/mcp' || (req.method === 'POST' && ['/oauth/register', '/oauth/token', '/oauth/revoke'].includes(req.path))
+  const isUpload = req.path.startsWith('/mcp/upload/')
+  const isApiPath = req.path === '/mcp' || isUpload || (req.method === 'POST' && ['/oauth/register', '/oauth/token', '/oauth/revoke'].includes(req.path))
   if (!isApiPath || !oauth.isEnabled()) {
     return next(err)
   }
   const status = (err.status >= 400 && err.status < 500) ? err.status : 500
   secureHeaders(res)
-  if (req.path === '/mcp') {
+  if (isUpload) {
+    if (status === 500) {
+      sendFileError(res, 500, 'Internal error.')
+    } else {
+      sendFileError(res, 415, 'Send the raw file bytes as the request body (e.g. curl -T file "<url>"), not JSON or a form. This link has not been used up.')
+    }
+  } else if (req.path === '/mcp') {
     res.status(status).json(status === 500 ? rpc.rpcError(null, -32603, 'Internal error.') : rpc.rpcError(null, -32700, 'Parse error: request body is not valid JSON.'))
   } else {
     res.status(status).json(status === 500 ? { error: 'server_error' } : { error: 'invalid_request', error_description: 'Malformed request body.' })

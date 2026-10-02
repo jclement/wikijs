@@ -3,7 +3,9 @@
  */
 
 const crypto = require('crypto')
+const fs = require('fs-extra')
 const http = require('http')
+const os = require('os')
 const path = require('path')
 const express = require('express')
 const bodyParser = require('body-parser')
@@ -29,7 +31,7 @@ const users = {
   // Administrator
   1: { id: 1, name: 'Admin', email: 'admin@wiki.test', isActive: true, isVerified: true, groups: [{ id: 1, permissions: ['manage:system'] }] },
   // Regular editor, limited to the "team" folder by page rules
-  3: { id: 3, name: 'Erin Editor', email: 'erin@wiki.test', isActive: true, isVerified: true, groups: [{ id: 3, permissions: ['read:pages', 'read:source', 'write:pages'] }] },
+  3: { id: 3, name: 'Erin Editor', email: 'erin@wiki.test', isActive: true, isVerified: true, groups: [{ id: 3, permissions: ['read:pages', 'read:source', 'write:pages', 'read:assets', 'write:assets'] }] },
   // Reader of everything
   4: { id: 4, name: 'Rae Reader', email: 'rae@wiki.test', isActive: true, isVerified: true, groups: [{ id: 4, permissions: ['read:pages'] }] }
 }
@@ -38,8 +40,12 @@ const groups = {
   1: { id: 1, permissions: ['manage:system'], pageRules: [] },
   3: {
     id: 3,
-    permissions: ['read:pages', 'read:source', 'write:pages'],
-    pageRules: [{ id: 'a', deny: false, match: 'START', roles: ['read:pages', 'read:source', 'write:pages'], path: 'team', locales: [] }]
+    permissions: ['read:pages', 'read:source', 'write:pages', 'read:assets', 'write:assets'],
+    pageRules: [
+      { id: 'a', deny: false, match: 'START', roles: ['read:pages', 'read:source', 'write:pages', 'read:assets', 'write:assets'], path: 'team', locales: [] },
+      { id: 'c', deny: true, match: 'EXACT', roles: ['read:assets'], path: 'team/private.png', locales: [] },
+      { id: 'd', deny: true, match: 'EXACT', roles: ['read:assets'], path: 'team/english.png', locales: ['en'] }
+    ]
   },
   4: {
     id: 4,
@@ -91,7 +97,7 @@ const userQuery = id => {
 let server
 let knex
 
-const request = (method, urlPath, { headers = {}, json, form } = {}) => new Promise((resolve, reject) => {
+const request = (method, urlPath, { headers = {}, json, form, raw } = {}) => new Promise((resolve, reject) => {
   let payload = null
   if (json !== undefined) {
     payload = JSON.stringify(json)
@@ -99,14 +105,18 @@ const request = (method, urlPath, { headers = {}, json, form } = {}) => new Prom
   } else if (form) {
     payload = new URLSearchParams(form).toString()
     headers['content-type'] = 'application/x-www-form-urlencoded'
+  } else if (raw) {
+    payload = raw
   }
   const req = http.request({ host: '127.0.0.1', port: server.address().port, path: urlPath, method, headers }, res => {
-    let text = ''
-    res.on('data', chunk => { text += chunk })
+    const chunks = []
+    res.on('data', chunk => { chunks.push(chunk) })
     res.on('end', () => {
+      const data = Buffer.concat(chunks)
+      const text = data.toString('utf8')
       let body = null
       try { body = JSON.parse(text) } catch (err) {}
-      resolve({ status: res.statusCode, headers: res.headers, text, body })
+      resolve({ status: res.statusCode, headers: res.headers, text, body, data })
     })
   })
   req.on('error', reject)
@@ -168,6 +178,46 @@ const rpc = (token, method, params) => request('POST', '/mcp', {
 })
 const callTool = async (token, name, args) => (await rpc(token, 'tools/call', { name, arguments: args })).body.result
 
+// The path part of a file link returned by a tool
+const linkIn = (result, kind) => {
+  const match = new RegExp(`${HOST}(/mcp/${kind}/[A-Za-z0-9_-]+)`).exec(result.content[0].text)
+  return match ? match[1] : null
+}
+
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64')
+
+let dataRoot
+
+const folderOf = async (parentId, slug) => {
+  const query = knex('assetFolders').where('slug', slug)
+  return (parentId ? query.where('parentId', parentId) : query.whereNull('parentId')).first()
+}
+
+const seedAsset = async (folderSlug, filename, data) => {
+  let folder = await folderOf(null, folderSlug)
+  if (!folder) {
+    await knex('assetFolders').insert({ slug: folderSlug, name: folderSlug, parentId: null })
+    folder = await folderOf(null, folderSlug)
+  }
+  const [id] = await knex('assets').insert({ filename, ext: path.extname(filename), kind: 'image', mime: 'image/png', fileSize: data.length, folderId: folder.id, authorId: 1, createdAt: '2026-01-01', updatedAt: '2026-01-01' })
+  await knex('assetData').insert({ id, data })
+}
+
+const storedAsset = async assetPath => {
+  const parts = assetPath.split('/')
+  const filename = parts.pop()
+  let folderId = null
+  for (const slug of parts) {
+    const folder = await folderOf(folderId, slug)
+    if (!folder) { return null }
+    folderId = folder.id
+  }
+  const query = knex('assets').where('filename', filename)
+  const asset = await (folderId ? query.where('folderId', folderId) : query.whereNull('folderId')).first()
+  if (!asset) { return null }
+  return { ...asset, data: (await knex('assetData').where('id', asset.id).first()).data }
+}
+
 // ----------------------------------------
 // Setup
 // ----------------------------------------
@@ -176,18 +226,47 @@ beforeAll(async () => {
   knex = Knex({ client: 'sqlite3', connection: { filename: ':memory:' }, useNullAsDefault: true })
   await knex.schema.createTable('users', table => { table.increments('id').primary() })
   await require('../../db/migrations-sqlite/2.5.129').up(knex)
+  await knex.schema.createTable('assetFolders', table => {
+    table.increments('id').primary()
+    table.string('name')
+    // Case-insensitive, like MySQL / MSSQL default collations
+    table.specificType('slug', 'varchar(255) collate nocase')
+    table.integer('parentId')
+  })
+  await knex.schema.createTable('assets', table => {
+    table.increments('id').primary()
+    table.specificType('filename', 'varchar(255) collate nocase')
+    table.string('ext')
+    table.string('kind')
+    table.string('mime')
+    table.integer('fileSize')
+    table.integer('folderId')
+    table.integer('authorId')
+    table.string('createdAt')
+    table.string('updatedAt')
+  })
+  await knex.schema.createTable('assetData', table => {
+    table.integer('id').primary()
+    table.binary('data')
+  })
+  dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'wiki-mcp-test-'))
 
   global.WIKI = {
     version: '2.5.0',
+    ROOTPATH: dataRoot,
     config: {
       host: HOST,
       title: 'Test Wiki',
       sessionSecret: 'test-secret',
       mcp: { enabled: true },
-      lang: { code: 'en', namespaces: [] }
+      lang: { code: 'en', namespaces: [] },
+      dataPath: './data',
+      uploads: { maxFileSize: 2000 },
+      pageExtensions: ['md', 'html', 'txt']
     },
     logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
     data: {
+      reservedPaths: ['login', 'img', 'js'],
       searchEngine: {
         query: async () => ({ results: pages.map(p => ({ id: p.id, path: p.path, locale: 'en', title: p.title, description: '' })), suggestions: [], totalHits: pages.length })
       }
@@ -201,6 +280,22 @@ beforeAll(async () => {
         createPage: jest.fn(),
         deletePage: jest.fn(),
         movePage: jest.fn()
+      },
+      assets: {
+        // Stand-in for the asset model: stores the file and removes the temporary upload
+        upload: jest.fn(async opts => {
+          const data = await fs.readFile(opts.path)
+          const query = knex('assets').where('filename', opts.originalname)
+          const existing = await (opts.folderId ? query.where('folderId', opts.folderId) : query.whereNull('folderId')).first()
+          if (existing) {
+            await knex('assets').where('id', existing.id).update({ fileSize: opts.size, mime: opts.mimetype })
+            await knex('assetData').where('id', existing.id).update({ data })
+          } else {
+            const [id] = await knex('assets').insert({ filename: opts.originalname, ext: path.extname(opts.originalname), kind: 'binary', mime: opts.mimetype, fileSize: opts.size, folderId: opts.folderId, authorId: opts.user.id, createdAt: 'now', updatedAt: 'now' })
+            await knex('assetData').insert({ id, data })
+          }
+          await fs.remove(opts.path)
+        })
       }
     }
   }
@@ -228,6 +323,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await new Promise(resolve => server.close(resolve))
   await knex.destroy()
+  await fs.remove(dataRoot)
 })
 
 beforeEach(() => {
@@ -240,6 +336,17 @@ beforeEach(() => {
   users[3].isActive = true
   require('../../controllers/mcp').rateLimitBuckets.clear()
   jest.clearAllMocks()
+})
+
+beforeEach(async () => {
+  await knex('assetData').del()
+  await knex('assets').del()
+  await knex('assetFolders').del()
+  await seedAsset('team', 'logo.png', PNG)
+  await seedAsset('team', 'notes.svg', Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'))
+  await seedAsset('hr', 'secret.png', PNG)
+  await seedAsset('team', 'private.png', PNG)
+  await seedAsset('team', 'english.png', PNG)
 })
 
 // ----------------------------------------
@@ -603,5 +710,164 @@ describe('mcp/tools', () => {
     expect((await callTool(tokens.access_token, 'read_page', { path: 5 })).isError).toBe(true)
     expect((await callTool(tokens.access_token, 'read_page', { path: 'team/notes', script: 'x' })).isError).toBe(true)
     expect((await callTool(tokens.access_token, 'read_page', { path: 'team/notes', locale: 'zz' })).isError).toBe(true)
+  })
+})
+
+describe('mcp/assets', () => {
+  it('lists only the folders and files the user may read', async () => {
+    const { tokens } = await connect(3)
+    const root = (await callTool(tokens.access_token, 'list_assets', {})).content[0].text
+    expect(root).toContain('[folder] team')
+    expect(root).not.toContain('hr')
+    const team = (await callTool(tokens.access_token, 'list_assets', { folder: 'team' })).content[0].text
+    expect(team).toContain('team/logo.png — image/png')
+    const hr = await callTool(tokens.access_token, 'list_assets', { folder: 'hr' })
+    expect(hr.isError).toBe(true)
+  })
+
+  it('shows images as images and text files as text', async () => {
+    const { tokens } = await connect(3)
+    const image = await callTool(tokens.access_token, 'view_asset', { path: '/team/logo.png' })
+    expect(image.isError).toBeUndefined()
+    expect(image.content[1]).toEqual({ type: 'image', data: PNG.toString('base64'), mimeType: 'image/png' })
+    const svg = await callTool(tokens.access_token, 'view_asset', { path: 'team/notes.svg' })
+    expect(svg.content[0].text).toContain('<svg xmlns')
+  })
+
+  it('makes forbidden files indistinguishable from missing ones', async () => {
+    const { tokens } = await connect(3)
+    const forbidden = await callTool(tokens.access_token, 'view_asset', { path: 'hr/secret.png' })
+    const missing = await callTool(tokens.access_token, 'view_asset', { path: 'hr/nothing.png' })
+    expect(forbidden.isError).toBe(true)
+    expect(forbidden.content[0].text.replace('secret', 'X')).toBe(missing.content[0].text.replace('nothing', 'X'))
+    const reader = await connect(4)
+    expect((await callTool(reader.tokens.access_token, 'view_asset', { path: 'team/logo.png' })).isError).toBe(true)
+  })
+
+  it.each([
+    ['denied by a rule', 'team/private.png'],
+    ['denied under another spelling', 'team/PRIVATE.PNG'],
+    ['denied by a locale-specific rule', 'team/english.png']
+  ])('refuses files %s', async (label, assetPath) => {
+    const { tokens } = await connect(3)
+    expect((await callTool(tokens.access_token, 'view_asset', { path: assetPath })).isError).toBe(true)
+    expect((await callTool(tokens.access_token, 'get_asset_download_url', { path: assetPath })).isError).toBe(true)
+    const listing = (await callTool(tokens.access_token, 'list_assets', { folder: 'team' })).content[0].text
+    expect(listing.toLowerCase()).not.toContain(assetPath.toLowerCase())
+  })
+
+  it('does not let concurrent uploads replace each other', async () => {
+    const { tokens } = await connect(3)
+    const results = await Promise.all(['first', 'second'].map(text => callTool(tokens.access_token, 'upload_asset', { path: 'team/race/same.svg', text })))
+    expect(results.filter(r => r.isError).length).toBe(1)
+    expect((await knex('assetFolders').where('slug', 'race')).length).toBe(1)
+  })
+
+  it('hands out download links for one file that stop working with the user', async () => {
+    const { tokens } = await connect(3, { allowWrite: false })
+    const result = await callTool(tokens.access_token, 'get_asset_download_url', { path: 'team/logo.png' })
+    const link = linkIn(result, 'download')
+    const res = await request('GET', link)
+    expect(res.status).toBe(200)
+    expect(res.data.equals(PNG)).toBe(true)
+    expect(res.headers['content-disposition']).toContain('attachment')
+    expect(res.headers['x-content-type-options']).toBe('nosniff')
+    // Usable more than once while valid, but not as anything else
+    expect((await request('GET', link)).status).toBe(200)
+    expect((await request('PUT', link.replace('download', 'upload'), { raw: PNG })).status).toBe(404)
+    expect((await request('GET', '/mcp/download/wmcp_dl_nope')).status).toBe(404)
+    users[3].isActive = false
+    expect((await request('GET', link)).status).toBe(404)
+  })
+
+  it('uploads through a single-use link, creating folders', async () => {
+    const { tokens } = await connect(3)
+    const result = await callTool(tokens.access_token, 'create_asset_upload', { path: 'team/Diagrams/Network Map.PNG' })
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0].text).toContain('team/diagrams/network_map.png')
+    const link = linkIn(result, 'upload')
+
+    // A wrongly encoded request does not use up the link
+    const json = await request('PUT', link, { json: { file: 'x' } })
+    expect(json.status).toBe(415)
+
+    const res = await request('PUT', link, { raw: PNG, headers: { 'content-type': 'application/octet-stream' } })
+    expect(res.status).toBe(201)
+    expect(res.body).toEqual(expect.objectContaining({ ok: true, path: 'team/diagrams/network_map.png', markdown: '![description](/team/diagrams/network_map.png)' }))
+    const stored = await storedAsset('team/diagrams/network_map.png')
+    expect(Buffer.from(stored.data).equals(PNG)).toBe(true)
+    expect(stored.mime).toBe('image/png')
+    expect(WIKI.models.assets.upload).toHaveBeenCalledWith(expect.objectContaining({ assetPath: 'team/diagrams/network_map.png', user: expect.objectContaining({ id: 3 }) }))
+
+    expect((await request('PUT', link, { raw: PNG })).status).toBe(404)
+    expect(await fs.readdir(path.join(dataRoot, 'data/uploads'))).toEqual([])
+  })
+
+  it('refuses oversized uploads and cleans up', async () => {
+    const { tokens } = await connect(3)
+    const link = linkIn(await callTool(tokens.access_token, 'create_asset_upload', { path: 'team/big.bin' }), 'upload')
+    const res = await request('PUT', link, { raw: Buffer.alloc(5000) })
+    expect(res.status).toBe(413)
+    // Without a declared length the limit is enforced while streaming
+    const streamed = linkIn(await callTool(tokens.access_token, 'create_asset_upload', { path: 'team/big.bin' }), 'upload')
+    const chunked = await request('PUT', streamed, { raw: Buffer.alloc(5000), headers: { 'transfer-encoding': 'chunked' } })
+    expect(chunked.status).toBe(413)
+    expect(await storedAsset('team/big.bin')).toBeNull()
+    expect(await fs.readdir(path.join(dataRoot, 'data/uploads'))).toEqual([])
+  })
+
+  it('never overwrites a file unless asked', async () => {
+    const { tokens } = await connect(3)
+    const refused = await callTool(tokens.access_token, 'create_asset_upload', { path: 'team/logo.png' })
+    expect(refused.isError).toBe(true)
+
+    // A file created after the link was issued is not overwritten either
+    const link = linkIn(await callTool(tokens.access_token, 'create_asset_upload', { path: 'team/later.png' }), 'upload')
+    await callTool(tokens.access_token, 'upload_asset', { path: 'team/later.png', base64: PNG.toString('base64') })
+    const late = await request('PUT', link, { raw: Buffer.from('other') })
+    expect(late.status).toBe(409)
+    expect(Buffer.from((await storedAsset('team/later.png')).data).equals(PNG)).toBe(true)
+
+    const replace = await callTool(tokens.access_token, 'upload_asset', { path: 'team/logo.png', text: 'replaced', overwrite: true })
+    expect(replace.content[0].text).toContain('Replaced team/logo.png')
+  })
+
+  it('uploads small inline files', async () => {
+    const { tokens } = await connect(3)
+    const svg = await callTool(tokens.access_token, 'upload_asset', { path: 'team/flow.svg', text: '<svg/>' })
+    expect(svg.isError).toBeUndefined()
+    expect(svg.content[0].text).toContain('![description](/team/flow.svg)')
+    expect(Buffer.from((await storedAsset('team/flow.svg')).data).toString()).toBe('<svg/>')
+    expect((await callTool(tokens.access_token, 'upload_asset', { path: 'team/x.png' })).isError).toBe(true)
+    expect((await callTool(tokens.access_token, 'upload_asset', { path: 'team/x.png', base64: 'not base64!' })).isError).toBe(true)
+  })
+
+  it.each([
+    ['outside the allowed folders', 'hr/x.png'],
+    ['a locale-like first segment', 'en/x.png'],
+    ['a reserved first segment', 'img/x.png'],
+    ['a wiki route', 'mcp/upload/x.png'],
+    ['a page extension', 'team/x.md'],
+    ['no extension', 'team/readme'],
+    ['path traversal', 'team/../hr/x.png'],
+    ['odd folder names', 'team/a b%/x.png']
+  ])('refuses uploads to %s', async (label, assetPath) => {
+    const { tokens } = await connect(3)
+    const result = await callTool(tokens.access_token, 'upload_asset', { path: assetPath, text: 'x' })
+    expect(result.isError).toBe(true)
+    expect(WIKI.models.assets.upload).not.toHaveBeenCalled()
+  })
+
+  it('offers no uploads on a read-only connection, and a link dies with the write scope', async () => {
+    const { tokens } = await connect(3, { allowWrite: false })
+    const names = (await rpc(tokens.access_token, 'tools/list')).body.result.tools.map(t => t.name)
+    expect(names).toEqual(expect.arrayContaining(['list_assets', 'view_asset', 'get_asset_download_url']))
+    expect(names).not.toContain('create_asset_upload')
+    expect(names).not.toContain('upload_asset')
+
+    const writer = await connect(3)
+    const link = linkIn(await callTool(writer.tokens.access_token, 'create_asset_upload', { path: 'team/a.png' }), 'upload')
+    await request('POST', '/oauth/revoke', { form: { token: writer.tokens.refresh_token } })
+    expect((await request('PUT', link, { raw: PNG })).status).toBe(404)
   })
 })

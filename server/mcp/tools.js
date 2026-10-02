@@ -1,5 +1,8 @@
 const _ = require('lodash')
+const fs = require('fs-extra')
 const TurndownService = require('turndown')
+const assets = require('./assets')
+const oauth = require('./oauth')
 
 /* global WIKI */
 
@@ -9,6 +12,9 @@ const TurndownService = require('turndown')
 
 const MAX_CONTENT_CHARS = 200000
 const MAX_LIST = 200
+const MAX_INLINE_IMAGE = 3 * 1024 * 1024
+const MAX_INLINE_TEXT = 1024 * 1024
+const MAX_INLINE_UPLOAD = 1024 * 1024
 
 class ToolError extends Error {}
 
@@ -143,6 +149,43 @@ const listVisiblePages = async (ctx, locale) => {
   return pages.filter(page => canSee(ctx, page))
 }
 
+/**
+ * Run asset operations, turning their expected failures into tool errors
+ */
+const assetOp = async fn => {
+  try {
+    return await fn()
+  } catch (err) {
+    if (err instanceof assets.AssetError) {
+      throw new ToolError(err.message)
+    }
+    throw err
+  }
+}
+
+const formatSize = bytes => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`
+
+const assetUrl = assetPath => `${oauth.baseUrl()}/${assetPath}`
+
+const describeAsset = asset => [
+  `path: ${asset.path}`,
+  `url: ${assetUrl(asset.path)}`,
+  `type: ${assets.mimeOf(asset.filename)}`,
+  `size: ${formatSize(_.toSafeInteger(asset.fileSize))}`,
+  `updated: ${asset.updatedAt}`
+].join('\n')
+
+const storedSummary = (ctx, stored) => {
+  audit(ctx, stored.replaced ? 'replaced file' : 'uploaded file', `${stored.path} (${stored.size} bytes)`)
+  return [
+    `${stored.replaced ? 'Replaced' : 'Uploaded'} ${stored.path} (${formatSize(stored.size)})`,
+    `url: ${assetUrl(stored.path)}`,
+    `Reference it in Markdown as: ${assets.markdownFor(stored.path)}`
+  ].join('\n')
+}
+
+const notViewableReason = (mime, size) => assets.INLINE_IMAGE_TYPES.includes(mime) ? `images over ${formatSize(MAX_INLINE_IMAGE)} are not shown` : (size > MAX_INLINE_TEXT ? 'too large' : `${mime} is not viewable`)
+
 const pageLine = page => `- ${page.localeCode || page.locale}/${page.path} — ${page.title}${page.description ? `: ${page.description}` : ''}`
 
 // ----------------------------------------
@@ -159,7 +202,7 @@ const tools = [
     inputSchema: { type: 'object', properties: {} },
     async handler (args, ctx) {
       const perms = ctx.user.permissions
-      const contentPerms = perms.includes('manage:system') ? ['all content (administrator)'] : perms.filter(p => /:(pages|source|history)$/.test(p))
+      const contentPerms = perms.includes('manage:system') ? ['all content (administrator)'] : perms.filter(p => /:(pages|source|history|assets)$/.test(p))
       return [
         `wiki: ${WIKI.config.title} (${_.trimEnd(_.toString(WIKI.config.host), '/')})`,
         `user: ${ctx.user.name}`,
@@ -376,6 +419,150 @@ const tools = [
       const counts = _.countBy(_.flatMap(pages, p => _.map(p.tags, 'tag')))
       const tags = _.sortBy(_.keys(counts))
       return tags.length > 0 ? tags.map(t => `- ${t} (${counts[t]})`).join('\n') : 'No tags found.'
+    }
+  },
+  {
+    name: 'list_assets',
+    title: 'List files',
+    description: 'List the uploaded files (images, documents) and subfolders in a folder of the wiki\'s file library. Omit folder for the top level.',
+    scope: 'wiki:read',
+    readOnly: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        folder: str('Folder path, e.g. "diagrams/network". Omit for the top level.', { maxLength: 255 })
+      }
+    },
+    async handler (args, ctx) {
+      const listing = await assetOp(() => assets.list(ctx.user, args.folder))
+      const lines = [
+        ...listing.folders.map(p => `- [folder] ${p}`),
+        ...listing.files.slice(0, MAX_LIST).map(f => `- [file] ${f.path} — ${assets.mimeOf(f.filename)}, ${formatSize(_.toSafeInteger(f.fileSize))}, updated ${f.updatedAt}`)
+      ]
+      if (lines.length < 1) {
+        return `Nothing visible in /${listing.path}.`
+      }
+      const more = listing.files.length > MAX_LIST ? `\n(showing the first ${MAX_LIST} of ${listing.files.length} files)` : ''
+      return `Contents of /${listing.path}:\n${lines.join('\n')}${more}`
+    }
+  },
+  {
+    name: 'view_asset',
+    title: 'View file',
+    description: 'Look at an uploaded file, such as an image referenced by a page (e.g. "/diagrams/flow.png" → path "diagrams/flow.png"). Images (PNG, JPEG, GIF, WebP) are returned as images and text files as text; for anything else use get_asset_download_url.',
+    scope: 'wiki:read',
+    readOnly: true,
+    inputSchema: {
+      type: 'object',
+      properties: { path: str('File path as it appears in the wiki URL, without leading slash.', { maxLength: 255 }) },
+      required: ['path']
+    },
+    async handler (args, ctx) {
+      const asset = await assetOp(() => assets.findReadable(ctx.user, args.path))
+      const mime = assets.mimeOf(asset.filename)
+      const size = _.toSafeInteger(asset.fileSize)
+      if (assets.INLINE_IMAGE_TYPES.includes(mime) && size <= MAX_INLINE_IMAGE) {
+        const data = await assetOp(() => assets.readData(asset))
+        return {
+          content: [
+            { type: 'text', text: describeAsset(asset) },
+            { type: 'image', data: data.toString('base64'), mimeType: mime }
+          ]
+        }
+      }
+      if (assets.isText(asset.filename) && size <= MAX_INLINE_TEXT) {
+        let text = (await assetOp(() => assets.readData(asset))).toString('utf8')
+        let note = ''
+        if (text.length > MAX_CONTENT_CHARS) {
+          text = text.slice(0, MAX_CONTENT_CHARS)
+          note = `\nnote: content truncated to the first ${MAX_CONTENT_CHARS} characters.`
+        }
+        return `${describeAsset(asset)}${note}\n---\n${text}`
+      }
+      return `${describeAsset(asset)}\nnote: this file cannot be shown here (${notViewableReason(mime, size)}). Use get_asset_download_url to download it.`
+    }
+  },
+  {
+    name: 'get_asset_download_url',
+    title: 'Get file download link',
+    description: 'Get a short-lived link (valid 5 minutes) that downloads an uploaded file without signing in, e.g. with curl. The link only grants access to that one file.',
+    scope: 'wiki:read',
+    readOnly: true,
+    inputSchema: {
+      type: 'object',
+      properties: { path: str('File path as it appears in the wiki URL, without leading slash.', { maxLength: 255 }) },
+      required: ['path']
+    },
+    async handler (args, ctx) {
+      const asset = await assetOp(() => assets.findReadable(ctx.user, args.path))
+      const token = await oauth.createFileToken({ grantId: ctx.grantId, kind: 'download', scope: 'wiki:read', assetPath: asset.path })
+      const url = `${oauth.baseUrl()}/mcp/download/${token}`
+      return [
+        describeAsset(asset),
+        `download url (valid ${oauth.DOWNLOAD_TTL / 60} minutes): ${url}`,
+        `example: curl -sSf -o ${asset.filename} "${url}"`
+      ].join('\n')
+    }
+  },
+  {
+    name: 'create_asset_upload',
+    title: 'Upload file (by link)',
+    description: 'Start uploading a file (image, PDF, etc.) to the wiki\'s file library. Returns a single-use link, valid 10 minutes, to send the raw file bytes to with HTTP PUT (e.g. curl -T). Missing folders are created. Use this for any real file; upload_asset is only for small generated text or tiny files.',
+    scope: 'wiki:write',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: str('Destination path including file name, e.g. "diagrams/network/flow.png". The name is lower-cased and spaces become underscores.', { maxLength: 255 }),
+        overwrite: { type: 'boolean', description: 'Replace an existing file at this path for everyone (default false).' }
+      },
+      required: ['path']
+    },
+    async handler (args, ctx) {
+      const plan = await assetOp(() => assets.planUpload(ctx.user, args.path, { overwrite: args.overwrite === true }))
+      const token = await oauth.createFileToken({ grantId: ctx.grantId, kind: 'upload', scope: 'wiki:write', assetPath: plan.assetPath, overwrite: args.overwrite === true })
+      const url = `${oauth.baseUrl()}/mcp/upload/${token}`
+      return [
+        `upload url (single use, valid ${oauth.UPLOAD_TTL / 60} minutes): ${url}`,
+        `Send the raw file bytes as the request body with HTTP PUT, for example:`,
+        `  curl -sSf -T ./local-file.${plan.filename.split('.').pop()} "${url}"`,
+        `Do not use multipart/form-data (curl -F) or a JSON content type. Maximum size: ${formatSize(assets.maxFileSize())}.`,
+        `The file will be stored at ${plan.assetPath}${plan.exists ? ', replacing the existing file' : ''}. The response is JSON and says whether it succeeded.`,
+        `Once uploaded, reference it in Markdown as: ${assets.markdownFor(plan.assetPath)}`
+      ].join('\n')
+    }
+  },
+  {
+    name: 'upload_asset',
+    title: 'Upload small file',
+    description: `Upload a small file (at most ${MAX_INLINE_UPLOAD / 1024} KB) by passing its content in the call: text (e.g. an SVG or CSV you wrote) or base64. Prefer create_asset_upload for existing files on disk. Missing folders are created.`,
+    scope: 'wiki:write',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: str('Destination path including file name, e.g. "diagrams/flow.svg".', { maxLength: 255 }),
+        text: str('File content as UTF-8 text. Give either text or base64.'),
+        base64: str('File content, base64 encoded. Give either text or base64.'),
+        overwrite: { type: 'boolean', description: 'Replace an existing file at this path for everyone (default false).' }
+      },
+      required: ['path']
+    },
+    async handler (args, ctx) {
+      if (_.isUndefined(args.text) === _.isUndefined(args.base64)) {
+        throw new ToolError('Provide exactly one of text or base64.')
+      }
+      if (!_.isUndefined(args.base64) && !/^[A-Za-z0-9+/\s]*={0,2}\s*$/.test(args.base64)) {
+        throw new ToolError('base64 is not valid base64.')
+      }
+      const data = _.isUndefined(args.text) ? Buffer.from(args.base64, 'base64') : Buffer.from(args.text, 'utf8')
+      if (data.length > Math.min(MAX_INLINE_UPLOAD, assets.maxFileSize())) {
+        throw new ToolError(`The file is larger than ${formatSize(Math.min(MAX_INLINE_UPLOAD, assets.maxFileSize()))}. Use create_asset_upload instead.`)
+      }
+      // Fail early, before writing anything
+      await assetOp(() => assets.planUpload(ctx.user, args.path, { overwrite: args.overwrite === true }))
+      const tmpPath = await assets.tempPath()
+      await fs.writeFile(tmpPath, data)
+      const stored = await assetOp(() => assets.store(ctx.user, args.path, tmpPath, { overwrite: args.overwrite === true }))
+      return storedSummary(ctx, stored)
     }
   },
   {
@@ -708,7 +895,8 @@ module.exports = {
       return { ...text(`Invalid input: ${invalid}`), isError: true }
     }
     try {
-      return text(await tool.handler(input, ctx))
+      const result = await tool.handler(input, ctx)
+      return _.isString(result) ? text(result) : result
     } catch (err) {
       if (err instanceof ToolError) {
         return { ...text(err.message), isError: true }
