@@ -45,15 +45,23 @@ module.exports = {
         throw new gql.GraphQLError('Invalid Group ID')
       }
 
-      // Check assigned permissions for write:groups
+      // Check assigned permissions for manage:users / write:groups
       if (
-        WIKI.auth.checkExclusiveAccess(req.user, ['write:groups'], ['manage:groups', 'manage:system']) &&
+        WIKI.auth.checkExclusiveAccess(req.user, ['manage:users', 'write:groups'], ['manage:groups', 'manage:system']) &&
         grp.permissions.some(p => {
           const resType = _.last(p.split(':'))
           return ['users', 'groups', 'navigation', 'theme', 'api', 'system'].includes(resType)
         })
       ) {
-        throw new gql.GraphQLError('You are not authorized to assign a user to this elevated group.')
+        throw new gql.GraphQLError('You are not authorized to assign a user to this administrative group.')
+      }
+
+      // Check assigned permissions for manage:groups
+      if (
+        WIKI.auth.checkExclusiveAccess(req.user, ['manage:groups'], ['manage:system']) &&
+        grp.permissions.some(p => _.last(p.split(':')) === 'system')
+      ) {
+        throw new gql.GraphQLError('You are not authorized to assign a user to a group with the manage:system permission.')
       }
 
       // Check for valid user
@@ -122,13 +130,19 @@ module.exports = {
     /**
      * UNASSIGN USER FROM GROUP
      */
-    async unassignUser (obj, args) {
+    async unassignUser (obj, args, { req }) {
       if (args.userId === 2) {
         throw new gql.GraphQLError('Cannot unassign Guest user')
       }
       if (args.userId === 1 && args.groupId === 1) {
         throw new gql.GraphQLError('Cannot unassign Administrator user from Administrators group.')
       }
+
+      // Check that the requester is allowed to manage the target user
+      if (!(await WIKI.auth.checkManageUserTargetAccess(req.user, args.userId))) {
+        throw new gql.GraphQLError('You are not authorized to unassign this user from a group.')
+      }
+
       const grp = await WIKI.models.groups.query().findById(args.groupId)
       if (!grp) {
         throw new gql.GraphQLError('Invalid Group ID')
@@ -170,7 +184,7 @@ module.exports = {
           return ['users', 'groups', 'navigation', 'theme', 'api', 'system'].includes(resType)
         })
       ) {
-        throw new gql.GraphQLError('You are not authorized to manage this group or assign these permissions.')
+        throw new gql.GraphQLError('You are not authorized to manage this group or assign these administrative permissions.')
       }
 
       // Check assigned permissions for manage:groups

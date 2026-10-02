@@ -1,6 +1,5 @@
 const _ = require('lodash')
-const Promise = require('bluebird')
-const getos = Promise.promisify(require('getos'))
+const getos = require('getos')
 const os = require('os')
 const filesize = require('filesize')
 const path = require('path')
@@ -10,6 +9,8 @@ const graphHelper = require('../../helpers/graph')
 const request = require('request-promise')
 const crypto = require('crypto')
 const nanoid = require('nanoid/non-secure').customAlphabet('1234567890abcdef', 10)
+
+const getosAsync = require('util').promisify(getos)
 
 /* global WIKI */
 
@@ -48,6 +49,17 @@ module.exports = {
         progress: Math.ceil(WIKI.system.exportStatus.progress),
         message: WIKI.system.exportStatus.message,
         startedAt: WIKI.system.exportStatus.startedAt
+      }
+    },
+    async backupStatus () {
+      return {
+        status: WIKI.backup.status.status,
+        progress: Math.ceil(WIKI.backup.status.progress),
+        message: WIKI.backup.status.message,
+        startedAt: WIKI.backup.status.startedAt,
+        filename: WIKI.backup.status.filename,
+        filePath: WIKI.backup.status.filePath,
+        fileSize: WIKI.backup.status.fileSize
       }
     }
   },
@@ -304,6 +316,34 @@ module.exports = {
       } catch (err) {
         return graphHelper.generateError(err)
       }
+    },
+
+    /**
+     * Create a .wkbackup package, for migrating to Wiki.js 3.x
+     */
+    async createBackup (obj, args, context) {
+      try {
+        // -> Only one export-type job at a time, as both stream the whole wiki
+        if (WIKI.backup.status.status === 'running') {
+          throw new Error('Another backup is already running.')
+        }
+        if (WIKI.system.exportStatus.status === 'running') {
+          throw new Error('An export is already running.')
+        }
+        // -> Validate entities
+        if (args.entities.length < 1) {
+          throw new Error('Must specify at least 1 entity to include.')
+        }
+        // -> Start backup
+        WIKI.backup.create({
+          entities: args.entities
+        })
+        return {
+          responseResult: graphHelper.generateSuccess('Backup started successfully.')
+        }
+      } catch (err) {
+        return graphHelper.generateError(err)
+      }
     }
   },
   SystemInfo: {
@@ -371,7 +411,7 @@ module.exports = {
     async operatingSystem () {
       let osLabel = `${os.type()} (${os.platform()}) ${os.release()} ${os.arch()}`
       if (os.platform() === 'linux') {
-        const osInfo = await getos()
+        const osInfo = await getosAsync()
         osLabel = `${os.type()} - ${osInfo.dist} (${osInfo.codename || os.platform()}) ${osInfo.release || os.release()} ${os.arch()}`
       }
       return osLabel

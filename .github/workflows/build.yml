@@ -19,7 +19,7 @@ jobs:
       packages: write
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set Build Variables
       run: |
@@ -42,14 +42,16 @@ jobs:
         cat package.json
 
     - name: Login to GitHub Container Registry
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         registry: ghcr.io
         username: ${{ github.repository_owner }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Build and push Docker images
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v7
+      env:
+        DOCKER_BUILD_SUMMARY: false
       with:
         context: .
         file: dev/build/Dockerfile
@@ -69,7 +71,7 @@ jobs:
         find _dist/wiki/ -printf "%P\n" | tar -czf wiki-js.tar.gz --no-recursion -C _dist/wiki/ -T -
 
     - name: Upload a Build Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: drop
         path: wiki-js.tar.gz
@@ -90,7 +92,7 @@ jobs:
         echo "REL_VERSION_STRICT=${GITHUB_REF_NAME#?}" >> $GITHUB_ENV
 
     - name: Login to GitHub Container Registry
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         registry: ghcr.io
         username: ${{ github.repository_owner }}
@@ -123,7 +125,7 @@ jobs:
 
 
     - name: Update GitHub Release
-      uses: ncipollo/release-action@v1.12.0
+      uses: ncipollo/release-action@v1.21.0
       with:
         allowUpdates: true
         draft: false
