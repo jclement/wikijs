@@ -28,6 +28,8 @@ defaults:
     offline: false
     ha: false
     bodyParserLimit: 5mb
+    mcp:
+      enabled: false
     # DB defaults
     api:
       isEnabled: false

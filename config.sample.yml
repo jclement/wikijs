@@ -133,6 +133,18 @@ offline: false
 ha: false
 
 # ---------------------------------------------------------------------
+# MCP Server (Model Context Protocol)
+# ---------------------------------------------------------------------
+# Lets users connect AI assistants (e.g. Claude) to this wiki at
+# <site url>/mcp. Each user signs in and approves the connection, which
+# can then only do what that user is allowed to do. Requires the Site
+# URL to be set in the Administration Area, and should only be enabled
+# when the wiki is served over HTTPS.
+
+mcp:
+  enabled: false
+
+# ---------------------------------------------------------------------
 # Data Path
 # ---------------------------------------------------------------------
 # Writeable data path used for cache and temporary user uploads.

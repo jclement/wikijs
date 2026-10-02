@@ -18,3 +18,5 @@ ssl:
 logLevel: $(LOG_LEVEL:info)
 logFormat: $(LOG_FORMAT:default)
 ha: $(HA_ACTIVE)
+mcp:
+  enabled: $(MCP_ENABLED:false)

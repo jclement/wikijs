@@ -1,0 +1,36 @@
+extends layout.pug
+
+block content
+  h1 Connect to #{siteTitle}
+  p
+    strong= clientName
+    |  wants to access this wiki on your behalf.
+  .box
+    span.muted Signed in as
+    strong #{user.name} (#{user.email})
+  .box
+    span.muted After you decide, you will be sent to
+    strong= redirectTarget
+  form(method='post', action='/oauth/authorize')
+    input(type='hidden', name='request', value=sealed.payload)
+    input(type='hidden', name='signature', value=sealed.signature)
+    p It will be able to:
+    ul
+      li
+        label
+          input(type='checkbox', checked, disabled)
+          span= scopeLabels['wiki:read']
+      if canRequestWrite
+        li
+          label
+            input(type='checkbox', name='allow_write', value='1', checked)
+            span #{scopeLabels['wiki:write']} (untick for read-only access)
+    p.muted
+      | It can never do more than your own account can, and it cannot change wiki settings, users or groups.
+      |  Only continue if you started this connection yourself. You can disconnect it at any time under
+      |
+      a(href='/oauth/connections') Connected applications
+      | .
+    .actions
+      button(type='submit', name='decision', value='deny') Deny
+      button.primary(type='submit', name='decision', value='approve') Allow

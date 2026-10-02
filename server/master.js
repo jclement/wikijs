@@ -163,6 +163,7 @@ module.exports = async () => {
     next()
   })
 
+  app.use('/', ctrl.mcp)
   app.use('/', ctrl.auth)
   app.use('/', ctrl.upload)
   app.use('/', ctrl.common)
@@ -176,6 +177,8 @@ module.exports = async () => {
     err.status = 404
     next(err)
   })
+
+  app.use(ctrl.mcp.errorHandler)
 
   app.use((err, req, res, next) => {
     if (req.path === '/graphql') {

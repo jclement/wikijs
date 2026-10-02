@@ -1,0 +1,23 @@
+extends layout.pug
+
+block content
+  h1 Connected applications
+  p.muted Applications you have allowed to access #{siteTitle} on your behalf, for example through Claude.
+  if revoked
+    .box Connection removed.
+  if grants.length < 1
+    p No applications are connected.
+  each grant in grants
+    .box
+      .row
+        div
+          strong= grant.clientName
+          span.muted #{grant.readOnly ? 'Read-only' : 'Read and write'} · connected #{grant.createdAt.slice(0, 10)} · last used #{grant.lastUsedAt.slice(0, 10)}
+        form(method='post', action='/oauth/connections/revoke')
+          input(type='hidden', name='grant', value=grant.id)
+          input(type='hidden', name='csrf', value=grant.csrf)
+          button.danger(type='submit') Disconnect
+  p.muted
+    | To connect a new application, add this wiki as a connector / MCP server using
+    |
+    code= mcpUrl
